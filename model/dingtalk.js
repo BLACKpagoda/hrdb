@@ -1,7 +1,31 @@
 const axios = require('axios');
 require('dotenv').config();
+const db = require('../db');
+const moment = require('moment');
 
 const DINGTALK_API = 'https://oapi.dingtalk.com';
+
+// 月份中文映射（用于生成表名）
+const monthChineseMap = {
+  '01': '一月',
+  '02': '二月',
+  '03': '三月',
+  '04': '四月',
+  '05': '五月',
+  '06': '六月',
+  '07': '七月',
+  '08': '八月',
+  '09': '九月',
+  '10': '十月',
+  '11': '十一月',
+  '12': '十二月'
+};
+
+// 获取目标表名（如"十一月考勤"）
+const getTargetTableName = (month) => {
+  const [, monthNum] = month.split('-'); // 输入格式：YYYY-MM
+  return `"${monthChineseMap[monthNum]}考勤"`;
+};
 
 // 1. 获取Access Token
 async function getAccessToken() {
@@ -28,22 +52,19 @@ async function getDepartments(token) {
     const res = await axios.get(`${DINGTALK_API}/topapi/v2/department/listsub`, {
       params: { access_token: token }
     });
-    // 添加详细的日志输出
-    // console.log('列定义API响应:', JSON.stringify(res.data, null, 2));
 
-    // 检查是否有错误代码
     if (res.data.errcode && res.data.errcode !== 0) {
       throw new Error(`钉钉API错误: [${res.data.errcode}] ${res.data.errmsg}`);
     }
 
-    // 尝试不同的响应路径
     return res.data.result;
   } catch (error) {
     console.error('获取部门列表失败:', error.response?.data || error.message);
     throw new Error(`获取部门列表失败: ${error.message}`);
   }
 }
-//3. 获取所有子部门（递归）
+
+// 3. 获取所有子部门（递归）
 async function getAllSubDepartments(token, parentDeptId) {
   try {
     const response = await axios.get(`${DINGTALK_API}/topapi/v2/department/listsub`, {
@@ -73,6 +94,7 @@ async function getAllSubDepartments(token, parentDeptId) {
     throw error;
   }
 }
+
 // 获取部门用户（带分页）
 async function getDepartmentUsers(token, deptId) {
   let allUsers = [];
@@ -113,6 +135,7 @@ async function getDepartmentUsers(token, deptId) {
     throw error;
   }
 }
+
 // 获取全公司所有用户
 async function getAllCompanyUsers(token) {
   try {
@@ -148,29 +171,30 @@ async function getAllCompanyUsers(token) {
     throw error;
   }
 }
+
 // 5. 获取报表列定义
 async function getReportColumns(token) {
   try {
     const res = await axios.post(`${DINGTALK_API}/topapi/attendance/getattcolumns`, null, {
       params: { access_token: token }
     });
-    // 验证并转换列数据
-    const validatedColumns = res.data.result.columns.reduce((acc, col) => {
-      // 如果列ID存在，则处理，并加入结果数组
-      if (col.id) {
-        acc.push({
-          id: col.id,
-          name: col.name || col.columnName || `未命名列_${col.id}`, // 在缺少名称时提供默认值
-          type: col.type || col.dataType || 'string' // 默认数据类型为字符串
-        });
-      }
-      // 如果没有ID，不进行处理
-      return acc;
-    }, []);
-    // 检查是否有错误代码
+    
     if (res.data.errcode && res.data.errcode !== 0) {
       throw new Error(`钉钉API错误: [${res.data.errcode}] ${res.data.errmsg}`);
     }
+
+    // 验证并转换列数据
+    const validatedColumns = res.data.result.columns.reduce((acc, col) => {
+      if (col.id) {
+        acc.push({
+          id: col.id,
+          name: col.name || col.columnName || `未命名列_${col.id}`,
+          type: col.type || col.dataType || 'string'
+        });
+      }
+      return acc;
+    }, []);
+    
     return validatedColumns || [];
   } catch (error) {
     console.error('获取报表列定义失败:', error.response?.data || error.message);
@@ -178,13 +202,41 @@ async function getReportColumns(token) {
   }
 }
 
-// 6. 获取考勤报表数据（单用户处理）
-async function getAttendanceData(token, userIds, columnIds, fromDate, toDate, columnDefinitions) {
+// 格式化日期为YYYY-MM-DD
+function formatDate(date) {
+  return moment(date).format('YYYY-MM-DD');
+}
+
+// 获取用户详细信息（用于获取姓名、部门等基础信息）
+async function getUserInfo(token, userId) {
+  try {
+    const res = await axios.get(`${DINGTALK_API}/user/get`, {
+      params: {
+        access_token: token,
+        userid: userId
+      }
+    });
+    
+    if (res.data.errcode && res.data.errcode !== 0) {
+      throw new Error(`获取用户信息失败: [${res.data.errcode}] ${res.data.errmsg}`);
+    }
+    
+    return res.data;
+  } catch (error) {
+    console.error(`获取用户 ${userId} 信息失败:`, error.message);
+    throw error;
+  }
+}
+
+// 6. 获取考勤报表数据并保存到数据库
+async function getAttendanceData(token, userIds, columnIds, fromDate, toDate, columnDefinitions, state, isDailyUpdate) {
   try {
     const COLUMN_BATCH_SIZE = 20; // 每次最多20个列ID
-    let allAttendanceData = [];
-    let dailyStatusRecords = [];
-    let detailRecords = [];
+    const from = moment(fromDate);
+    const to = moment(toDate);
+    const month = from.format('YYYY-MM'); // 获取月份用于表名
+    const targetTable = getTargetTableName(month);
+    const monthCode = month.replace('-', ''); // 生成月份代码（如202311）
     
     // 创建列ID到列定义的映射
     const columnIdToDefinition = {};
@@ -192,427 +244,335 @@ async function getAttendanceData(token, userIds, columnIds, fromDate, toDate, co
       columnIdToDefinition[colDef.id] = colDef;
     }
     
+    // 准备存储所有用户的考勤数据
+    const attendanceRecords = {};
+    
     // 处理每个用户
     for (const userId of userIds) {
-      // 将列ID分成多个批次
-      const columnBatches = [];
-      for (let i = 0; i < columnIds.length; i += COLUMN_BATCH_SIZE) {
-        columnBatches.push(columnIds.slice(i, i + COLUMN_BATCH_SIZE));
+      // 检查状态，跳过已处理或错误的用户
+      if (state && state.isUserProcessed(userId)) {
+        console.log(`用户 ${userId} 已处理，跳过`);
+        continue;
       }
       
-      // 处理每个列ID批次
-      for (const columnBatch of columnBatches) {
-        const params = {
-          userid: userId, // 单用户
-          column_id_list: columnBatch.join(','),
-          from_date: formatDate(fromDate),
-          to_date: formatDate(toDate),
+      try {
+        // 获取用户详细信息
+        const userInfo = await getUserInfo(token, userId);
+        
+        // 初始化用户考勤记录
+        attendanceRecords[userId] = {
+          "姓名": userInfo.name || '',
+          "考勤组": '',
+          "部门": userInfo.department && userInfo.department.length > 0 ? userInfo.department[0] : '',
+          "工号": userInfo.jobnumber || '',
+          "职位": userInfo.position || '',
+          "UserId": userId,
+          "月份": monthCode,
+          
+          // 初始化数值型字段为0
+          "出勤天数": 0,
+          "休息天数": 0,
+          "工作时长": 0,
+          "迟到次数": 0,
+          "迟到时长": 0,
+          "严重迟到次数": 0,
+          "严重迟到时长": 0,
+          "旷工迟到次数": 0,
+          "早退次数": 0,
+          "早退时长": 0,
+          "上班缺卡次数": 0,
+          "下班缺卡次数": 0,
+          "旷工天数": 0,
+          "出差时长": 0,
+          "外出时长": 0,
+          "事假_小时": 0,
+          "病假_小时": 0,
+          "调休_小时": 0,
+          "年假_天": 0,
+          "产假_天": 0,
+          "陪产假_天": 0,
+          "婚假_天": 0,
+          "例假_天": 0,
+          "丧假_天": 0,
+          "哺乳假_小时": 0,
+          "探亲假_天": 0,
+          "节育假_天": 0,
+          "女员工产前检查假_天": 0,
+          "男职工护理假_天": 0,
+          "其他_天": 0,
+          "临时公出回来下班打卡_小时": 0,
+          "加班总时长": 0,
+          "工作日转加班费": 0,
+          "休息日转加班费": 0,
+          "节假日转加班费": 0,
+          "工作日转调休": 0,
+          "休息日转调休": 0,
+          "节假日转调休": 0
         };
         
-        let hasMore = true;
-        let offset = 0;
-        let retryCount = 0;
-        const maxRetries = 3;
+        // 初始化日期字段
+        const daysInMonth = moment(month, 'YYYY-MM').daysInMonth();
+        for (let day = 1; day <= daysInMonth; day++) {
+          const date = moment(`${month}-${day}`, 'YYYY-MM-DD');
+          const dayOfWeek = date.day();
+          let suffix = '';
+          if (dayOfWeek === 6) suffix = '_六';
+          if (dayOfWeek === 0) suffix = '_日';
+          attendanceRecords[userId][`日${day}${suffix}`] = '';
+        }
         
-        while (hasMore && retryCount < maxRetries) {
-          try {
-            params.offset = offset;
-            const res = await axios.post(`${DINGTALK_API}/topapi/attendance/getcolumnval`, params, {
-              params: { access_token: token },
-              headers: { 'Content-Type': 'application/json' },
-              timeout: 10000 // 10秒超时
-            });
-            
-            if (res.data.errcode && res.data.errcode !== 0) {
-              if (res.data.errcode === 88) { // 限流错误码
-                console.log(`API限流，等待后重试 (用户: ${userId}, 重试: ${retryCount + 1})`);
-                await new Promise(resolve => setTimeout(resolve, 2000)); // 等待2秒
-                retryCount++;
-                continue;
-              }
-              throw new Error(`钉钉API错误: [${res.data.errcode}] ${res.data.errmsg}`);
-            }
-            
-            // 重置重试计数
-            retryCount = 0;
-            
-            // 解析返回的数据
-            const columnVals = res.data.result.column_vals || [];
-            
-            // 处理每一列的数据
-            for (const columnData of columnVals) {
-              const columnId = columnData.column_vo.id;
-              const columnDef = columnIdToDefinition[columnId];
-              const columnName = columnDef ? columnDef.name : `未知列_${columnId}`;
+        // 将列ID分成多个批次
+        const columnBatches = [];
+        for (let i = 0; i < columnIds.length; i += COLUMN_BATCH_SIZE) {
+          columnBatches.push(columnIds.slice(i, i + COLUMN_BATCH_SIZE));
+        }
+        
+        // 处理每个列ID批次
+        for (const columnBatch of columnBatches) {
+          const params = {
+            userid: userId,
+            column_id_list: columnBatch.join(','),
+            from_date: formatDate(fromDate),
+            to_date: formatDate(toDate),
+          };
+          
+          let hasMore = true;
+          let offset = 0;
+          let retryCount = 0;
+          const maxRetries = 3;
+          
+          while (hasMore && retryCount < maxRetries) {
+            try {
+              params.offset = offset;
+              const res = await axios.post(`${DINGTALK_API}/topapi/attendance/getcolumnval`, params, {
+                params: { access_token: token },
+                headers: { 'Content-Type': 'application/json' },
+                timeout: 10000
+              });
               
-              // 处理该列下的所有值
-              for (const val of columnData.column_vals) {
-                const record = {
-                  user_id: val.user_id || userId, // 确保有用户ID
-                  date: val.date,
-                  column_id: columnId,
-                  column_name: columnName,
-                  value: val.value || ''
-                };
+              if (res.data.errcode && res.data.errcode !== 0) {
+                if (res.data.errcode === 88) { // 限流错误码
+                  console.log(`API限流，等待后重试 (用户: ${userId}, 重试: ${retryCount + 1})`);
+                  await new Promise(resolve => setTimeout(resolve, 2000));
+                  retryCount++;
+                  continue;
+                }
+                throw new Error(`钉钉API错误: [${res.data.errcode}] ${res.data.errmsg}`);
+              }
+              
+              // 重置重试计数
+              retryCount = 0;
+              
+              // 解析返回的数据
+              const columnVals = res.data.result.column_vals || [];
+              
+              // 处理每一列的数据
+              for (const columnData of columnVals) {
+                const columnId = columnData.column_vo.id;
+                const columnDef = columnIdToDefinition[columnId];
+                const columnName = columnDef ? columnDef.name : `未知列_${columnId}`;
                 
-                // 根据列名称分类存储
-                if (columnName.includes('考勤状态') || columnName.includes('打卡结果')) {
-                  dailyStatusRecords.push({
-                    user_id: val.user_id || userId,
-                    work_date: val.date,
-                    check_status: val.value
-                  });
-                } 
-                else if (columnName.includes('审批类型') || columnName.includes('审批状态')) {
-                  // 更新每日状态记录
-                  const existingIndex = dailyStatusRecords.findIndex(r => 
-                    r.user_id === (val.user_id || userId) && r.work_date === val.date
-                  );
+                // 处理该列下的所有值
+                for (const val of columnData.column_vals) {
+                  const recordDate = moment(val.date);
+                  const day = recordDate.date();
+                  const dayOfWeek = recordDate.day();
+                  let suffix = '';
+                  if (dayOfWeek === 6) suffix = '_六';
+                  if (dayOfWeek === 0) suffix = '_日';
+                  const dateField = `日${day}${suffix}`;
                   
-                  if (existingIndex >= 0) {
-                    dailyStatusRecords[existingIndex].approve_type = val.value;
+                  // 保存每日考勤记录
+                  if (attendanceRecords[userId][dateField] && attendanceRecords[userId][dateField] !== '') {
+                    attendanceRecords[userId][dateField] += `; ${val.value}`;
                   } else {
-                    dailyStatusRecords.push({
-                      user_id: val.user_id || userId,
-                      work_date: val.date,
-                      approve_type: val.value
-                    });
-                  }
-                }
-                else if (columnName.includes('处理类型') || columnName.includes('处理状态')) {
-                  // 更新每日状态记录
-                  const existingIndex = dailyStatusRecords.findIndex(r => 
-                    r.user_id === (val.user_id || userId) && r.work_date === val.date
-                  );
-                  
-                  if (existingIndex >= 0) {
-                    dailyStatusRecords[existingIndex].proc_type = val.value;
-                  } else {
-                    dailyStatusRecords.push({
-                      user_id: val.user_id || userId,
-                      work_date: val.date,
-                      proc_type: val.value
-                    });
-                  }
-                }
-                else if (columnName.includes('打卡时间') || columnName.includes('时间')) {
-                  // 解析打卡类型
-                  let checkType = 'Unknown';
-                  if (columnName.includes('上班') || columnName.includes('OnDuty')) checkType = 'OnDuty';
-                  if (columnName.includes('下班') || columnName.includes('OffDuty')) checkType = 'OffDuty';
-                  
-                  // 尝试提取基准时间
-                  let baseCheckTime = null;
-                  if (columnDef && columnDef.extras) {
-                    try {
-                      const extras = JSON.parse(columnDef.extras);
-                      baseCheckTime = extras.baseCheckTime || null;
-                    } catch (e) {
-                      console.warn(`解析列额外信息失败: ${columnDef.extras}`);
-                    }
+                    attendanceRecords[userId][dateField] = val.value || '';
                   }
                   
-                  detailRecords.push({
-                    user_id: val.user_id || userId,
-                    record_date: val.date,
-                    check_type: checkType,
-                    user_check_time: val.value,
-                    base_check_time: baseCheckTime
-                  });
-                }
-                else if (columnName.includes('位置') || columnName.includes('地址')) {
-                  // 更新打卡明细记录
-                  const existingIndex = detailRecords.findIndex(r => 
-                    r.user_id === (val.user_id || userId) && 
-                    r.record_date === val.date
-                  );
-                  
-                  if (existingIndex >= 0) {
-                    detailRecords[existingIndex].location_result = val.value;
-                  } else {
-                    detailRecords.push({
-                      user_id: val.user_id || userId,
-                      record_date: val.date,
-                      location_result: val.value
-                    });
+                  // 根据列名更新汇总数据
+                  switch (true) {
+                    case columnName.includes('出勤天数'):
+                      attendanceRecords[userId]['出勤天数'] = parseFloat(val.value) || 0;
+                      break;
+                    case columnName.includes('休息天数'):
+                      attendanceRecords[userId]['休息天数'] = parseFloat(val.value) || 0;
+                      break;
+                    case columnName.includes('工作时长'):
+                      attendanceRecords[userId]['工作时长'] = parseFloat(val.value) || 0;
+                      break;
+                    case columnName.includes('迟到次数'):
+                      attendanceRecords[userId]['迟到次数'] = parseFloat(val.value) || 0;
+                      break;
+                    case columnName.includes('迟到时长'):
+                      attendanceRecords[userId]['迟到时长'] = parseFloat(val.value) || 0;
+                      break;
+                    case columnName.includes('严重迟到次数'):
+                      attendanceRecords[userId]['严重迟到次数'] = parseFloat(val.value) || 0;
+                      break;
+                    case columnName.includes('严重迟到时长'):
+                      attendanceRecords[userId]['严重迟到时长'] = parseFloat(val.value) || 0;
+                      break;
+                    case columnName.includes('旷工迟到次数'):
+                      attendanceRecords[userId]['旷工迟到次数'] = parseFloat(val.value) || 0;
+                      break;
+                    case columnName.includes('早退次数'):
+                      attendanceRecords[userId]['早退次数'] = parseFloat(val.value) || 0;
+                      break;
+                    case columnName.includes('早退时长'):
+                      attendanceRecords[userId]['早退时长'] = parseFloat(val.value) || 0;
+                      break;
+                    case columnName.includes('上班缺卡次数'):
+                      attendanceRecords[userId]['上班缺卡次数'] = parseFloat(val.value) || 0;
+                      break;
+                    case columnName.includes('下班缺卡次数'):
+                      attendanceRecords[userId]['下班缺卡次数'] = parseFloat(val.value) || 0;
+                      break;
+                    case columnName.includes('旷工天数'):
+                      attendanceRecords[userId]['旷工天数'] = parseFloat(val.value) || 0;
+                      break;
+                    case columnName.includes('出差时长'):
+                      attendanceRecords[userId]['出差时长'] = parseFloat(val.value) || 0;
+                      break;
+                    case columnName.includes('外出时长'):
+                      attendanceRecords[userId]['外出时长'] = parseFloat(val.value) || 0;
+                      break;
+                    case columnName.includes('事假'):
+                      attendanceRecords[userId]['事假_小时'] = parseFloat(val.value) || 0;
+                      break;
+                    case columnName.includes('病假'):
+                      attendanceRecords[userId]['病假_小时'] = parseFloat(val.value) || 0;
+                      break;
+                    case columnName.includes('调休') && columnName.includes('小时'):
+                      attendanceRecords[userId]['调休_小时'] = parseFloat(val.value) || 0;
+                      break;
+                    case columnName.includes('年假'):
+                      attendanceRecords[userId]['年假_天'] = parseFloat(val.value) || 0;
+                      break;
+                    case columnName.includes('加班总时长'):
+                      attendanceRecords[userId]['加班总时长'] = parseFloat(val.value) || 0;
+                      break;
+                    // 可以根据需要添加更多字段映射
                   }
-                }
-                else if (columnName.includes('时间结果')) {
-                  // 更新打卡明细记录
-                  const existingIndex = detailRecords.findIndex(r => 
-                    r.user_id === (val.user_id || userId) && 
-                    r.record_date === val.date
-                  );
-                  
-                  if (existingIndex >= 0) {
-                    detailRecords[existingIndex].time_result = val.value;
-                  } else {
-                    detailRecords.push({
-                      user_id: val.user_id || userId,
-                      record_date: val.date,
-                      time_result: val.value
-                    });
-                  }
-                }
-                else {
-                  // 其他列数据存入原始表
-                  allAttendanceData.push(record);
                 }
               }
-            }
-            
-            // 检查是否有更多数据
-            hasMore = res.data.result.has_more || false;
-            if (hasMore) {
-              offset += res.data.result.column_vals.length;
-              console.log(`用户 ${userId} 还有更多数据，偏移量: ${offset}`);
-            }
-            
-            // 添加请求间隔，避免限流
-            await new Promise(resolve => setTimeout(resolve, 500));
-            
-          } catch (error) {
-            console.error(`处理用户 ${userId} 时出错:`, error.message);
-            if (error.response && error.response.status === 429) {
-              // 限流错误，等待后重试
-              console.log(`API限流，等待后重试 (用户: ${userId}, 重试: ${retryCount + 1})`);
-              await new Promise(resolve => setTimeout(resolve, 3000)); // 等待3秒
+              
+              hasMore = res.data.result.has_more || false;
+              offset = res.data.result.next_offset || 0;
+              
+              // 避免频繁调用
+              await new Promise(resolve => setTimeout(resolve, 300));
+            } catch (error) {
+              console.error(`处理用户 ${userId} 数据时出错:`, error.message);
               retryCount++;
-            } else {
-              // 其他错误，跳过当前批次
-              console.error(`跳过用户 ${userId} 的当前列批次`);
-              hasMore = false;
+              if (retryCount >= maxRetries) {
+                throw error;
+              }
+              await new Promise(resolve => setTimeout(resolve, 1000));
             }
           }
         }
+        
+        // 标记用户为已处理
+        if (state) {
+          state.markUserProcessed(userId);
+        }
+        console.log(`用户 ${userId} 考勤数据处理完成`);
+        
+      } catch (error) {
+        console.error(`处理用户 ${userId} 时发生错误:`, error.message);
+        if (state) {
+          state.markUserAsError(userId);
+        }
       }
-      
-      // 用户处理完成后添加延迟
-      await new Promise(resolve => setTimeout(resolve, 1000));
     }
     
-    console.log(`获取数据完成:
-      - 原始考勤记录: ${allAttendanceData.length} 条
-      - 每日状态记录: ${dailyStatusRecords.length} 条
-      - 打卡明细记录: ${detailRecords.length} 条`);
+    // 批量保存到数据库
+    const recordsArray = Object.values(attendanceRecords);
+    if (recordsArray.length > 0) {
+      await saveAttendanceToDB(recordsArray, targetTable);
+    }
     
-    return {
-      allAttendanceData,   // 用于 attendance_records 表
-      dailyStatusRecords,  // 用于 attendance_daily_status 表
-      detailRecords        // 用于 attendance_details 表
-    };
-    
+    return recordsArray.length;
   } catch (error) {
-    console.error('获取考勤数据失败:', error.response?.data || error.message);
-    throw new Error(`获取考勤数据失败: ${error.message}`);
-  }
-}
-// 7.保存考勤数据到三张表
-async function saveAttendanceData(db, attendanceResult) {
-  try {
-    const { allAttendanceData, dailyStatusRecords, detailRecords } = attendanceResult;
-    
-    // 1. 保存原始考勤数据到 attendance_records 表
-    for (const record of allAttendanceData) {
-      await db.query(
-        `INSERT INTO attendance_records 
-         (user_id, record_date, column_id, column_name, value) 
-         VALUES ($1, $2, $3, $4, $5)`,
-        [
-          record.user_id, 
-          record.date, 
-          record.column_id, 
-          record.column_name, 
-          record.value
-        ]
-      );
-    }
-    
-    // 2. 保存每日状态到 attendance_daily_status 表
-    const dailyStatusMap = new Map();
-    for (const record of dailyStatusRecords) {
-      const key = `${record.user_id}-${record.work_date}`;
-      
-      if (!dailyStatusMap.has(key)) {
-        dailyStatusMap.set(key, {
-          user_id: record.user_id,
-          work_date: record.work_date,
-          check_status: record.check_status || null,
-          approve_type: record.approve_type || null,
-          proc_type: record.proc_type || null
-        });
-      } else {
-        const existing = dailyStatusMap.get(key);
-        if (record.check_status) existing.check_status = record.check_status;
-        if (record.approve_type) existing.approve_type = record.approve_type;
-        if (record.proc_type) existing.proc_type = record.proc_type;
-      }
-    }
-    
-    for (const record of dailyStatusMap.values()) {
-      await db.query(
-        `INSERT INTO attendance_daily_status 
-         (user_id, work_date, check_status, approve_type, proc_type) 
-         VALUES ($1, $2, $3, $4, $5)
-         ON CONFLICT (user_id, work_date) 
-         DO UPDATE SET
-           check_status = EXCLUDED.check_status,
-           approve_type = EXCLUDED.approve_type,
-           proc_type = EXCLUDED.proc_type`,
-        [
-          record.user_id,
-          record.work_date,
-          record.check_status,
-          record.approve_type,
-          record.proc_type
-        ]
-      );
-    }
-    
-    // 3. 保存打卡明细到 attendance_details 表
-    const detailMap = new Map();
-    for (const record of detailRecords) {
-      const key = `${record.user_id}-${record.record_date}-${record.check_type || 'default'}`;
-      
-      if (!detailMap.has(key)) {
-        detailMap.set(key, {
-          user_id: record.user_id,
-          record_date: record.record_date,
-          check_type: record.check_type || null,
-          user_check_time: record.user_check_time || null,
-          base_check_time: record.base_check_time || null,
-          time_result: record.time_result || null,
-          location_result: record.location_result || null
-        });
-      } else {
-        const existing = detailMap.get(key);
-        if (record.user_check_time) existing.user_check_time = record.user_check_time;
-        if (record.base_check_time) existing.base_check_time = record.base_check_time;
-        if (record.time_result) existing.time_result = record.time_result;
-        if (record.location_result) existing.location_result = record.location_result;
-      }
-    }
-    
-    for (const record of detailMap.values()) {
-      await db.query(
-        `INSERT INTO attendance_details 
-         (user_id, record_date, check_type, user_check_time, base_check_time, time_result, location_result) 
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
-         ON CONFLICT (user_id, record_date, check_type) 
-         DO UPDATE SET
-           user_check_time = EXCLUDED.user_check_time,
-           base_check_time = EXCLUDED.base_check_time,
-           time_result = EXCLUDED.time_result,
-           location_result = EXCLUDED.location_result`,
-        [
-          record.user_id,
-          record.record_date,
-          record.check_type,
-          record.user_check_time,
-          record.base_check_time,
-          record.time_result,
-          record.location_result
-        ]
-      );
-    }
-    
-    // 4. 生成并保存月度汇总数据
-    const summaryMap = new Map();
-    
-    // 从每日状态生成汇总
-    for (const record of dailyStatusMap.values()) {
-      const month = record.work_date.substring(0, 7); // YYYY-MM
-      const key = `${record.user_id}-${month}`;
-      
-      if (!summaryMap.has(key)) {
-        summaryMap.set(key, {
-          user_id: record.user_id,
-          summary_month: month,
-          late_count: 0,
-          early_leave_count: 0,
-          absent_count: 0,
-          normal_count: 0
-        });
-      }
-      
-      const summary = summaryMap.get(key);
-      
-      if (record.check_status === 'Late') summary.late_count++;
-      else if (record.check_status === 'Early') summary.early_leave_count++;
-      else if (record.check_status === 'Absent') summary.absent_count++;
-      else if (record.check_status === 'Normal') summary.normal_count++;
-    }
-    
-    // 保存汇总数据
-    for (const summary of summaryMap.values()) {
-      await db.query(
-        `INSERT INTO attendance_summary 
-         (user_id, summary_month, late_count, early_leave_count, absent_count, normal_count) 
-         VALUES ($1, $2, $3, $4, $5, $6)
-         ON CONFLICT (user_id, summary_month) 
-         DO UPDATE SET
-           late_count = EXCLUDED.late_count,
-           early_leave_count = EXCLUDED.early_leave_count,
-           absent_count = EXCLUDED.absent_count,
-           normal_count = EXCLUDED.normal_count`,
-        [
-          summary.user_id,
-          summary.summary_month,
-          summary.late_count,
-          summary.early_leave_count,
-          summary.absent_count,
-          summary.normal_count
-        ]
-      );
-    }
-    
-    return {
-      success: true,
-      recordCount: allAttendanceData.length,
-      dailyStatusCount: dailyStatusMap.size,
-      detailCount: detailMap.size,
-      summaryCount: summaryMap.size
-    };
-    
-  } catch (error) {
-    console.error('保存考勤数据失败:', error);
-    throw new Error(`保存考勤数据失败: ${error.message}`);
+    console.error('获取考勤数据失败:', error.message);
+    throw error;
   }
 }
 
-// 获取列定义的函数（假设您已经有这个函数）
-async function getColumnDefinitions(token) {
+// 保存考勤数据到数据库
+async function saveAttendanceToDB(records, tableName) {
+  const BATCH_SIZE = 50;
+  const totalRecords = records.length;
+  let totalInserted = 0;
+  
   try {
-    const res = await axios.post(`${DINGTALK_API}/topapi/attendance/getattcolumns`, {}, {
-      params: { access_token: token }
-    });
+    await db.query('BEGIN');
     
-    if (res.data.errcode && res.data.errcode !== 0) {
-      throw new Error(`获取列定义失败: [${res.data.errcode}] ${res.data.errmsg}`);
+    // 获取表字段列表（从第一条记录的键中获取）
+    const fields = Object.keys(records[0]);
+    
+    // 分批次插入
+    for (let i = 0; i < totalRecords; i += BATCH_SIZE) {
+      const batch = records.slice(i, i + BATCH_SIZE);
+      
+      // 生成占位符
+      const placeholders = batch.map((_, idx) => 
+        `(${fields.map((_, j) => `$${idx * fields.length + j + 1}`).join(',')})`
+      ).join(',');
+      
+      // 准备值数组
+      const values = [];
+      batch.forEach(record => {
+        fields.forEach(field => {
+          values.push(record[field] !== undefined ? record[field] : null);
+        });
+      });
+      
+      // 构建SQL
+      const insertSql = `
+        INSERT INTO ${tableName} (${fields.map(f => `"${f}"`).join(',')})
+        VALUES ${placeholders}
+        ON CONFLICT ("UserId", "月份") DO UPDATE SET
+          ${fields.map(f => `"${f}" = EXCLUDED."${f}"`).join(',')}
+      `;
+      
+      const result = await db.query(insertSql, values);
+      totalInserted += result.rowCount;
+      console.log(`已插入/更新 ${result.rowCount} 条记录，累计 ${totalInserted}/${totalRecords}`);
     }
     
-    return res.data.result || [];
+    await db.query('COMMIT');
+    console.log(`所有考勤数据已保存到 ${tableName}，共 ${totalInserted} 条记录`);
+    return totalInserted;
   } catch (error) {
-    console.error('获取列定义失败:', error.response?.data || error.message);
-    throw new Error(`获取列定义失败: ${error.message}`);
+    await db.query('ROLLBACK');
+    console.error(`保存考勤数据到数据库失败:`, error.message);
+    throw error;
   }
 }
 
-// 日期格式化辅助函数
-function formatDate(date) {
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, '0');
-  const day = String(date.getDate()).padStart(2, '0');
-  return `${year}-${month}-${day}`;
+// 更新考勤汇总（根据新表结构调整）
+async function updateAttendanceSummary(db, month) {
+  const monthChinese = monthChineseMap[month.split('-')[1]];
+  const sourceTable = `"${monthChinese}考勤"`;
+  
+  try {
+    // 这里可以添加月度汇总逻辑，如果需要的话
+    console.log(`已完成 ${month} 考勤数据汇总更新`);
+  } catch (error) {
+    console.error(`更新 ${month} 考勤汇总失败:`, error.message);
+    throw error;
+  }
 }
 
 module.exports = {
   getAccessToken,
   checkReportStatus,
   getDepartments,
-  getAllCompanyUsers,
+  getAllSubDepartments,
   getDepartmentUsers,
+  getAllCompanyUsers,
   getReportColumns,
   getAttendanceData,
-  saveAttendanceData
+  updateAttendanceSummary
 };

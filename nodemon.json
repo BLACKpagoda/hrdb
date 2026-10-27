@@ -1,0 +1,23 @@
+{
+  "watch": [
+    "bin/www",
+    "app.js",
+    "db.js",
+    "routes/",
+    "modules/",
+    "config/",
+    "common/"
+  ],
+  "ext": "js,json",
+  "ignore": [
+    "node_modules/",
+    "model/",
+    "controller/",
+    "public/",
+    "views/"
+  ],
+  "exec": "node ./bin/www",
+  "env": {
+    "NODE_ENV": "development"
+  }
+}

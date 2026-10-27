@@ -1,5 +1,6 @@
 var createError = require('http-errors');
 var express = require('express');
+const cors = require('cors');
 var path = require('path');
 var cookieParser = require('cookie-parser');
 var logger = require('morgan');
@@ -20,12 +21,69 @@ app.use(express.urlencoded({ extended: false }));
 app.use(cookieParser());
 app.use(express.static(path.join(__dirname, 'public')));
 
+
+// 详细CORS配置
+const corsOptions = {
+  origin: function (origin, callback) {
+    // 允许的域名列表
+    const allowedOrigins = [
+      'http://localhost:3000',
+      'http://127.0.0.1:3000',
+      'http://localhost:3001',
+      'http://127.0.0.1:3001'
+    ];
+    
+    // 如果是开发环境或允许的域名，允许请求
+    if (!origin || allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      callback(new Error('不允许的跨域请求'));
+    }
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+  optionsSuccessStatus: 200 // 一些旧浏览器（IE11, various SmartTVs）choke on 204
+};
+
+// 应用CORS中间件
+app.use(cors(corsOptions));
+
+// 配置CORS中间件
+app.use(cors({
+  origin: 'http://localhost:3000', // 允许的前端地址
+  credentials: true, // 允许携带凭证（如cookies）
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'], // 允许的HTTP方法
+  allowedHeaders: ['Content-Type', 'Authorization'] // 允许的请求头
+}));
+
 app.use('/', indexRouter);
 app.use('/users', usersRouter);
 
-// catch 404 and forward to error handler
-app.use(function(req, res, next) {
-  next(createError(404));
+// 错误处理中间件
+app.use((err, req, res, next) => {
+  console.error(err.stack);
+  
+  // CORS错误处理
+  if (err.message === '不允许的跨域请求') {
+    return res.status(403).json({
+      success: false,
+      error: '跨域请求被拒绝'
+    });
+  }
+  
+  res.status(500).json({
+    success: false,
+    error: err.message
+  });
+});
+
+// 404处理
+app.use((req, res) => {
+  res.status(404).json({
+    success: false,
+    error: '接口不存在'
+  });
 });
 
 // error handler
@@ -42,9 +100,6 @@ app.use(function(err, req, res, next) {
 db.query('SELECT 1+1 AS result')
   .then(() => console.log('数据库连接成功'))
   .catch(err => console.error('数据库连接失败:', err));
-const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => {
-  console.log(`服务运行中: http://localhost:${PORT}`);
-});
+// 注意：实际监听由 bin/www 完成，此处不再调用 app.listen 避免端口冲突
 
 module.exports = app;

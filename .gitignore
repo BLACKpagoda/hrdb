@@ -1,2 +1,13 @@
 # Ignore node_modules folder
 node_modules/
+
+# 环境变量（含数据库密码、钉钉密钥，严禁入库）
+.env
+
+# 数据库导出文件（含真实业务数据）
+db_export/
+
+# 临时脚本和日志
+rematch_log.txt
+*.log
+tmp_*.js
