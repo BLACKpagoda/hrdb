@@ -47,15 +47,10 @@ const corsOptions = {
 };
 
 // 应用CORS中间件
+// 注：此处曾同时注册两个 cors()，后一个把 origin 收窄为仅 localhost:3000，
+// 覆盖了上面的白名单（导致 127.0.0.1:3000 / localhost:3001 等来源全部被拒）。
+// 已删除重复的那一个，只保留白名单版本。
 app.use(cors(corsOptions));
-
-// 配置CORS中间件
-app.use(cors({
-  origin: 'http://localhost:3000', // 允许的前端地址
-  credentials: true, // 允许携带凭证（如cookies）
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'], // 允许的HTTP方法
-  allowedHeaders: ['Content-Type', 'Authorization'] // 允许的请求头
-}));
 
 app.use('/', indexRouter);
 app.use('/users', usersRouter);

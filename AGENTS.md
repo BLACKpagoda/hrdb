@@ -29,7 +29,7 @@ npm start          # 等价，无热重载
 
 端口来自 `.env` 的 `PORT=3001`（`bin/www` 里 `process.env.PORT || '3000'`）。
 
-`.env` **不入库**，首次部署需自行创建，键名如下（值找负责人要）：
+`.env` **不入库**，首次部署复制模板即可：`cp .env.example .env`，然后填值（值找负责人要）：
 
 ```
 DINGTALK_APP_KEY / DINGTALK_APP_SECRET
@@ -60,12 +60,18 @@ modules/<业务>/
 
 ### `model/` 是历史遗留区
 
-重构前的旧代码，**不要往里面加新东西**：
+重构前的旧代码，**不要往里面加新东西**。2026-10-30 已清理掉 6 个确认无引用的死文件
+（`dingtalk.js`、`salary.js`、`analyze.js`、`excelImporter.js`、`model.js`、`utils.js`，其中前五个
+已被 `modules/` 完全取代）。现存 3 个：
 
-- 已被 `modules/` 取代、**可删**：`dingtalk.js`、`salary.js`、`analyze.js`、`excelImporter.js`、`model.js`、`utils.js`
-- **仍在用**：`fanruanExport.js`（被 `/export-fanruan` 调）、`export.js`（被 `/import-employees` 调）
+- `fanruanExport.js` — 被 `POST /export-fanruan` 调
+- `export.js` — 被 `POST /import-employees` 调
+- `init_attendance_tables.js` — 建表脚本，手工执行，非运行时依赖
 
-## 接口清单（33 个，代码实测）
+
+## 接口清单（32 个业务接口，代码实测）
+
+> 另有 `GET /users`（`routes/users.js`，Express 脚手架遗留，无业务用途，可删）。
 
 考勤看板 `modules/attendance-board/`（17 个，全部 GET）
 ```
@@ -135,11 +141,11 @@ GET  /personnel/list          员工列表分页
 |---|------|------|
 | 1 | `req.file.path` 为 undefined（memoryStorage 下不存在），而 `model/export.js` 用 `fs.existsSync` 只接受路径 → `/import-employees` 实际不可用 | `routes/index.js` + `model/export.js` |
 | 2 | `extractDailyRecords` 日期硬编码只适用 2025-09，应按 month 动态生成 | `modules/attendance-excel/service.js` |
-| 3 | `app.js` 有**两处** `app.use(cors(...))`，第二个把 origin 收窄成只剩 `localhost:3000`，前者配置被覆盖 | [app.js](app.js) |
-| 4 | 脚手架遗留，未使用可删 | `routes/users.js` |
-| 5 | 6 个死文件可删 | `model/` 见上 |
-| 6 | 未使用依赖可删 | `knex`、`bullmq`、`@alicloud/*` |
-| 7 | `.git` 有 **35MB**，因 `uploads/` 下 9 个二进制曾入库（现已 gitignore，但历史仍在） | 仓库历史 |
+| 3 | 脚手架遗留端点，未使用可删（需同步删 `app.js` 的挂载） | `routes/users.js` |
+| 4 | 未使用依赖可删，但需联网跑 `npm install` 重建 lock | `knex`、`bullmq`、`@alicloud/*` |
+| 5 | `.git` 有 **35MB**，因 `uploads/` 下 9 个二进制曾入库（现已 gitignore，但历史仍在） | 仓库历史 |
+
+> 已修复（2026-10-30）：`app.js` 重复注册两个 `cors()`、后者覆盖白名单的问题；`model/` 下 6 个死文件。
 
 ## 验证（改完必须跑，不许只靠读代码判断）
 
